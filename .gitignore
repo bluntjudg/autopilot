@@ -24,3 +24,5 @@ yarn.lock
 #files
 file_manager.py
 reddit_automation/node_modules/
+Reddit.drawio-draw.io_files
+Reddit.drawio-draw.io.html
