@@ -1,0 +1,21 @@
+# Node
+**/node_modules/
+npm-debug.log*
+yarn.lock
+
+# Env
+**/.env
+**/.env.*
+
+# Playwright / Chrome
+**/playwright/.cache/
+**/auth/state.json
+
+# Runtime data
+**/data/*.json
+
+# OS
+.DS_Store
+
+# Logs
+*.log
