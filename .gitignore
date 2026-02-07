@@ -19,3 +19,8 @@ yarn.lock
 
 # Logs
 *.log
+
+
+#files
+file_manager.py
+reddit_automation/node_modules/
