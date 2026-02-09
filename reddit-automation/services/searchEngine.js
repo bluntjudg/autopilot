@@ -4,10 +4,10 @@ import fetch from "node-fetch";
 const SUBREDDITS_PATH = "config/subreddits.json";
 const QUERIES_PATH = "config/queries.json";
 const OUTPUT_PATH = "data/fetched_posts.json";
+const FAILURE_PATH = "data/search_failures.json";
 
-/**
- * Safe JSON reader
- */
+/* ---------------- helpers ---------------- */
+
 function readJSON(filePath, fallback = {}) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
@@ -19,9 +19,66 @@ function readJSON(filePath, fallback = {}) {
   }
 }
 
+function writeJSON(path, data) {
+  fs.writeFileSync(path, JSON.stringify(data, null, 2));
+}
+
 /**
- * Load existing fetched posts into a Set (disk memory)
+ * IST timestamp (Asia/Kolkata)
+ * Format: YYYY-MM-DDTHH:mm:ss
  */
+function nowIST() {
+  return new Date()
+    .toLocaleString("sv-SE", { timeZone: "Asia/Kolkata" })
+    .replace(" ", "T");
+}
+
+/* ---------------- failure memory ---------------- */
+
+function getFailureState() {
+  return readJSON(FAILURE_PATH, {});
+}
+
+function recordFailure(subreddit, status) {
+  const failures = getFailureState();
+  const prev = failures[subreddit] || { fail_count: 0 };
+
+  const failCount = prev.fail_count + 1;
+  const cooldownMinutes = Math.min(60, failCount * 10);
+
+  const cooldownUntil = new Date(
+    Date.now() + cooldownMinutes * 60 * 1000
+  )
+    .toLocaleString("sv-SE", { timeZone: "Asia/Kolkata" })
+    .replace(" ", "T");
+
+  failures[subreddit] = {
+    fail_count: failCount,
+    cooldown_until: cooldownUntil,
+    last_error: status
+  };
+
+  writeJSON(FAILURE_PATH, failures);
+}
+
+function clearFailure(subreddit) {
+  const failures = getFailureState();
+  if (failures[subreddit]) {
+    delete failures[subreddit];
+    writeJSON(FAILURE_PATH, failures);
+  }
+}
+
+function isSubredditCoolingDown(subreddit) {
+  const failures = getFailureState();
+  const entry = failures[subreddit];
+  if (!entry) return false;
+
+  return Date.now() < new Date(entry.cooldown_until).getTime();
+}
+
+/* ---------------- dedupe ---------------- */
+
 function loadExistingPostKeys() {
   const existing = readJSON(OUTPUT_PATH, []);
   const keys = new Set();
@@ -34,37 +91,25 @@ function loadExistingPostKeys() {
   return { existing, keys };
 }
 
-/**
- * Append ONLY new, unique posts to fetched_posts.json
- */
 function appendFreshPostsOnly(newPosts) {
   const { existing, keys } = loadExistingPostKeys();
   const fresh = [];
 
   for (const post of newPosts) {
     const key = post.post_id || post.url;
-    if (keys.has(key)) {
-      console.log(`⛔ Duplicate skipped (disk): ${key}`);
-      continue;
-    }
+    if (keys.has(key)) continue;
     keys.add(key);
     fresh.push(post);
   }
 
-  if (fresh.length === 0) {
-    console.log("⛔ No new unique posts found");
-    return 0;
-  }
+  if (fresh.length === 0) return 0;
 
-  const updated = [...existing, ...fresh];
-  fs.writeFileSync(OUTPUT_PATH, JSON.stringify(updated, null, 2));
-
+  writeJSON(OUTPUT_PATH, [...existing, ...fresh]);
   return fresh.length;
 }
 
-/**
- * Build Reddit search URL
- */
+/* ---------------- reddit fetch ---------------- */
+
 function buildSearchUrl({ subreddit, query, after }) {
   const base = `https://www.reddit.com/r/${subreddit}/search.json`;
   const params = new URLSearchParams({
@@ -79,24 +124,19 @@ function buildSearchUrl({ subreddit, query, after }) {
   return `${base}?${params.toString()}`;
 }
 
-/**
- * Fetch posts from a subreddit + query
- */
 async function fetchSubredditPosts(subreddit, query) {
   let after = null;
   let allPosts = [];
 
   for (let page = 0; page < 2; page++) {
-    console.log(`🔍 Fetching: ${subreddit} | "${query}"`);
-
     const res = await fetch(
       buildSearchUrl({ subreddit, query, after }),
       { headers: { "User-Agent": "reddit-automation-bot/1.0" } }
     );
 
     if (!res.ok) {
-      console.error(`❌ ${res.status} for r/${subreddit}`);
-      break;
+      recordFailure(subreddit, res.status);
+      throw new Error(`HTTP ${res.status}`);
     }
 
     const json = await res.json();
@@ -112,7 +152,7 @@ async function fetchSubredditPosts(subreddit, query) {
       created_utc: c.data.created_utc,
       score: c.data.score,
       num_comments: c.data.num_comments,
-      fetched_at: new Date().toISOString()
+      fetched_at: nowIST()
     }));
 
     allPosts.push(...normalized);
@@ -120,13 +160,12 @@ async function fetchSubredditPosts(subreddit, query) {
     if (!after) break;
   }
 
+  clearFailure(subreddit);
   return allPosts;
 }
 
-/**
- * PURE SEARCH WORKER
- * No sleep. No rate logic. No orchestration.
- */
+/* ---------------- public API ---------------- */
+
 export async function runSearchEngine() {
   const { subreddits } = readJSON(SUBREDDITS_PATH, { subreddits: "" });
   const { templates } = readJSON(QUERIES_PATH, { templates: [] });
@@ -139,9 +178,19 @@ export async function runSearchEngine() {
   let collected = [];
 
   for (const subreddit of subredditList) {
+    if (isSubredditCoolingDown(subreddit)) {
+      console.log(`⏳ Skipping ${subreddit} (cooldown active)`);
+      continue;
+    }
+
     for (const query of templates) {
-      const posts = await fetchSubredditPosts(subreddit, query);
-      collected.push(...posts);
+      try {
+        const posts = await fetchSubredditPosts(subreddit, query);
+        collected.push(...posts);
+      } catch (err) {
+        console.warn(`⚠️ ${subreddit} failed: ${err.message}`);
+        break;
+      }
     }
   }
 
