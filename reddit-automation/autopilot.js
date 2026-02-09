@@ -11,8 +11,8 @@ import { generateCommentsForQueue } from "./services/commentGenerator.js";
 /* ================= CONFIG ================= */
 
 const LAST_SEARCH_PATH = "data/last_search.json";
-const SEARCH_INTERVAL_MIN = 10;          // search every 5 minutes
-const LOOP_HEARTBEAT_MS = 60 * 1000;    // 1 minute loop tick
+const SEARCH_INTERVAL_MIN = 10;     // how often to search
+const LOOP_SLEEP_MS = 60 * 1000;    // loop heartbeat (1 min)
 
 /* ================= UTILS ================= */
 
@@ -20,19 +20,27 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function safeReadJSON(path, fallback = []) {
+  try {
+    if (!fs.existsSync(path)) return fallback;
+    const raw = fs.readFileSync(path, "utf-8");
+    if (!raw.trim()) return fallback;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    console.warn(`⚠️ Failed reading ${path}, using fallback`);
+    return fallback;
+  }
+}
+
 function getLastSearchTime() {
   try {
     if (!fs.existsSync(LAST_SEARCH_PATH)) return null;
-
     const raw = fs.readFileSync(LAST_SEARCH_PATH, "utf-8");
     if (!raw.trim()) return null;
-
     const parsed = JSON.parse(raw);
-    if (!parsed.last_run) return null;
-
-    return new Date(parsed.last_run);
+    return parsed.last_run ? new Date(parsed.last_run) : null;
   } catch {
-    console.warn("⚠️ last_search.json invalid, resetting");
     return null;
   }
 }
@@ -47,7 +55,6 @@ function setLastSearchTime() {
 function shouldRunSearch() {
   const last = getLastSearchTime();
   if (!last) return true;
-
   const diffMin = (Date.now() - last.getTime()) / 60000;
   return diffMin >= SEARCH_INTERVAL_MIN;
 }
@@ -59,46 +66,52 @@ async function runStage1to4() {
 
   await runSearchEngine();
 
-  const raw = readJSON("data/fetched_posts.json");
+  const raw = safeReadJSON("data/fetched_posts.json", []);
   const fresh = filterAlreadyCommented(raw);
 
-  const approvedPosts = [];
+  const approved = [];
 
   for (const post of fresh) {
-    const result = await isPostRelevant(post);
-    if (result?.approved === true) {
-      approvedPosts.push(post);
+    try {
+      const res = await isPostRelevant(post);
+      if (res?.approved === true) approved.push(post);
+    } catch {
+      console.warn("⚠️ relevance check failed, skipping post");
     }
   }
 
-  console.log(`✅ Approved ${approvedPosts.length} posts`);
-  buildCommentQueue(approvedPosts);
+  console.log(`✅ Approved ${approved.length} posts`);
+  buildCommentQueue(approved);
 }
 
-/* ================= COMMENTER (LIVE OUTPUT) ================= */
+/* ================= COMMENTER (NON-BLOCKING) ================= */
 
-function runCommenterLive() {
-  return new Promise((resolve, reject) => {
-    const child = spawn("node", ["playwright/commenter.js"], {
-      stdio: ["inherit", "pipe", "pipe"]
-    });
+/**
+ * IMPORTANT:
+ * - Fire-and-forget
+ * - Must NOT be awaited
+ * - Commenter may run cooldowns internally
+ */
+function runCommenterDetached() {
+  console.log("🚀 Spawning commenter (non-blocking)");
 
-    child.stdout.on("data", d => process.stdout.write(d.toString()));
-    child.stderr.on("data", d => process.stderr.write(d.toString()));
-
-    child.on("close", code => {
-      if (code !== 0) reject(new Error(`commenter exited with ${code}`));
-      else resolve();
-    });
+  const child = spawn("node", ["playwright/commenter.js"], {
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: true
   });
+
+  child.stdout.on("data", d => process.stdout.write(d.toString()));
+  child.stderr.on("data", d => process.stderr.write(d.toString()));
+
+  child.unref(); // 🔑 allow parent loop to continue
 }
 
 /* ================= AUTOPILOT ================= */
 
-(async () => {
+(async function autopilot() {
   console.log("🤖 AUTOPILOT STARTED (24×7 MODE)");
 
-  // Run search immediately on startup
+  // Initial startup search
   if (shouldRunSearch()) {
     console.log("🔍 Initial startup search");
     await runStage1to4();
@@ -108,40 +121,43 @@ function runCommenterLive() {
   while (true) {
     console.log("\n🌀 New loop tick");
 
-    const queue = readJSON("data/to_comment.json");
-    const pending = queue.find(p => p.status === "PENDING");
-    const ready = queue.find(p => p.status === "COMMENT_READY");
+    try {
+      const queue = safeReadJSON("data/to_comment.json", []);
+      const hasPending = queue.some(p => p.status === "PENDING");
+      const hasReady = queue.some(p => p.status === "COMMENT_READY");
 
-    /* 🔍 SEARCH CHECK */
-    if (shouldRunSearch()) {
-      console.log("🔍 Search interval reached → running search");
-      await runStage1to4();
-      setLastSearchTime();
-    } else {
-      const last = getLastSearchTime();
-      if (last) {
-        const minsLeft = Math.ceil(
-          SEARCH_INTERVAL_MIN -
-          (Date.now() - last.getTime()) / 60000
-        );
-        console.log(`⏳ Next search in ~${minsLeft} min`);
+      /* 🔍 SEARCH */
+      if (shouldRunSearch()) {
+        console.log("🔍 Search interval reached → running search");
+        await runStage1to4();
+        setLastSearchTime();
+      } else {
+        const last = getLastSearchTime();
+        if (last) {
+          const minsLeft = Math.ceil(
+            SEARCH_INTERVAL_MIN -
+            (Date.now() - last.getTime()) / 60000
+          );
+          console.log(`⏳ Next search in ~${minsLeft} min`);
+        }
       }
+
+      /* ✍️ GENERATE */
+      if (hasPending) {
+        console.log("✍️ Stage 5A: Generating comment");
+        await generateCommentsForQueue({ batchSize: 1 });
+      }
+
+      /* 🚀 POST (NON-BLOCKING) */
+      if (hasReady) {
+        runCommenterDetached(); // DO NOT await
+      }
+
+    } catch (err) {
+      console.error("❌ Loop error (recovered):", err);
     }
 
-    /* ✍️ GENERATE COMMENT */
-    if (pending) {
-      console.log("✍️ Stage 5A: Generating comment");
-      await generateCommentsForQueue({ batchSize: 1 });
-    }
-
-    /* 🚀 POST COMMENT */
-    if (ready) {
-      console.log("🚀 Stage 5B: Posting comment");
-      await runCommenterLive();
-    }
-
-    /* 💤 ALWAYS SLEEP */
-    console.log("😴 Loop complete → sleeping 1 min");
-    await sleep(LOOP_HEARTBEAT_MS);
+    console.log("😴 Loop sleeping 1 min");
+    await sleep(LOOP_SLEEP_MS);
   }
 })();

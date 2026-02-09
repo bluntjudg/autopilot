@@ -1,7 +1,6 @@
 import fs from "fs";
 import http from "http";
 import { chromium } from "playwright";
-import { cooldownTimer } from "../utils/sleep.js";
 
 const CDP_ENDPOINT = "http://localhost:9222";
 const QUEUE_PATH = "data/to_comment.json";
@@ -96,7 +95,6 @@ async function postOne(page) {
   writeJSON(QUEUE_PATH, queue);
   writeJSON(COMMENTED_PATH, commented);
 
-  await cooldownTimer(3, 5);
   return true;
 }
 
@@ -108,9 +106,8 @@ async function postOne(page) {
   const cdpAlive = await checkCDP();
   if (!cdpAlive) {
     console.error("\n❌ Chrome is NOT running in CDP mode");
-    console.error("👉 Start it like this:");
     console.error(
-      "google-chrome --remote-debugging-port=9222 --user-data-dir=$HOME/chrome-cdp\n"
+      "👉 google-chrome --remote-debugging-port=9222 --user-data-dir=$HOME/chrome-cdp\n"
     );
     process.exit(1);
   }
@@ -135,13 +132,12 @@ async function postOne(page) {
   await page.bringToFront();
   console.log("✅ Reddit tab attached");
 
-  while (true) {
-    const didPost = await postOne(page);
-    if (!didPost) {
-      console.log("📭 No more COMMENT_READY posts");
-      break;
-    }
+  const didPost = await postOne(page);
+
+  if (!didPost) {
+    console.log("📭 No COMMENT_READY post found");
   }
 
   console.log("🏁 Commenter finished cleanly");
+  process.exit(0);
 })();
