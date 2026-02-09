@@ -1,0 +1,37 @@
+{
+  "enabled": true,
+
+  "subreddits": {
+    "source": "config/subreddits.json",
+    "bucket_count": 4
+  },
+
+  "queries": {
+    "source": "config/queries.json"
+  },
+
+  "search_params": {
+    "sort": "new",
+    "time": "day",
+    "limit": 25,
+    "restrict_sr": true,
+    "type": "any",
+    "raw_json": true
+  },
+
+  "pagination": {
+    "max_pages": 2
+  },
+
+  "pacing": {
+    "delay_between_requests_ms": 3000,
+    "delay_between_buckets_ms": 5000,
+    "backoff_on_429_ms": 15000,
+    "max_backoff_ms": 120000
+  },
+
+  "loop": {
+    "run_full_cycle_before_sleep": true,
+    "sleep_after_cycle_minutes": 10
+  }
+}

@@ -2,17 +2,15 @@ import fs from "fs";
 import { spawn } from "child_process";
 
 import { runSearchEngine } from "./services/searchEngine.js";
-import { readJSON } from "./services/postStore.js";
-import { filterAlreadyCommented } from "./services/dedupe.js";
-import { isPostRelevant } from "./services/aiFilter.js";
+import { runAIFilter } from "./services/aiFilter.js";
 import { buildCommentQueue } from "./services/queueManager.js";
 import { generateCommentsForQueue } from "./services/commentGenerator.js";
 
 /* ================= CONFIG ================= */
 
 const LAST_SEARCH_PATH = "data/last_search.json";
-const SEARCH_INTERVAL_MIN = 10;     // how often to search
-const LOOP_SLEEP_MS = 60 * 1000;    // loop heartbeat (1 min)
+const SEARCH_INTERVAL_MIN = 10;     // search rate limit (ONLY here)
+const LOOP_SLEEP_MS = 60 * 1000;    // heartbeat (1 min)
 
 /* ================= UTILS ================= */
 
@@ -25,8 +23,7 @@ function safeReadJSON(path, fallback = []) {
     if (!fs.existsSync(path)) return fallback;
     const raw = fs.readFileSync(path, "utf-8");
     if (!raw.trim()) return fallback;
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : fallback;
+    return JSON.parse(raw);
   } catch {
     console.warn(`⚠️ Failed reading ${path}, using fallback`);
     return fallback;
@@ -59,38 +56,35 @@ function shouldRunSearch() {
   return diffMin >= SEARCH_INTERVAL_MIN;
 }
 
-/* ================= STAGE 1–4 ================= */
-
-async function runStage1to4() {
-  console.log("\n🔄 Stage 1–4: Search → Filter → Queue");
-
-  await runSearchEngine();
-
-  const raw = safeReadJSON("data/fetched_posts.json", []);
-  const fresh = filterAlreadyCommented(raw);
-
-  const approved = [];
-
-  for (const post of fresh) {
-    try {
-      const res = await isPostRelevant(post);
-      if (res?.approved === true) approved.push(post);
-    } catch {
-      console.warn("⚠️ relevance check failed, skipping post");
-    }
-  }
-
-  console.log(`✅ Approved ${approved.length} posts`);
-  buildCommentQueue(approved);
-}
-
-/* ================= COMMENTER (NON-BLOCKING) ================= */
+/* ================= PIPELINE ================= */
 
 /**
- * IMPORTANT:
- * - Fire-and-forget
- * - Must NOT be awaited
- * - Commenter may run cooldowns internally
+ * Stage 1–4
+ * Search → AI Filter → Queue
+ *
+ * NOTE:
+ * - No per-post loops here
+ * - No OpenAI calls here
+ * - Everything is batch + disk-based
+ */
+async function runStage1to4() {
+  console.log("\n🔄 Stage 1–4: Search → AI Filter → Queue");
+
+  // 1️⃣ Fetch & store (deduped internally)
+  await runSearchEngine();
+
+  // 2️⃣ Approve / reject new posts (deduped internally)
+  await runAIFilter();
+
+  // 3️⃣ Build comment queue from approved posts
+  buildCommentQueue();
+}
+
+/* ================= COMMENTER ================= */
+
+/**
+ * Fire-and-forget commenter
+ * MUST NOT block autopilot loop
  */
 function runCommenterDetached() {
   console.log("🚀 Spawning commenter (non-blocking)");
@@ -103,7 +97,7 @@ function runCommenterDetached() {
   child.stdout.on("data", d => process.stdout.write(d.toString()));
   child.stderr.on("data", d => process.stderr.write(d.toString()));
 
-  child.unref(); // 🔑 allow parent loop to continue
+  child.unref(); // allow parent loop to continue
 }
 
 /* ================= AUTOPILOT ================= */
@@ -111,24 +105,28 @@ function runCommenterDetached() {
 (async function autopilot() {
   console.log("🤖 AUTOPILOT STARTED (24×7 MODE)");
 
-  // Initial startup search
+  /* ---------- INITIAL BOOT ---------- */
+
   if (shouldRunSearch()) {
     console.log("🔍 Initial startup search");
     await runStage1to4();
     setLastSearchTime();
   }
 
+  /* ---------- MAIN LOOP ---------- */
+
   while (true) {
-    console.log("\n🌀 New loop tick");
+    console.log("\n🌀 Loop tick");
 
     try {
       const queue = safeReadJSON("data/to_comment.json", []);
+
       const hasPending = queue.some(p => p.status === "PENDING");
       const hasReady = queue.some(p => p.status === "COMMENT_READY");
 
       /* 🔍 SEARCH */
       if (shouldRunSearch()) {
-        console.log("🔍 Search interval reached → running search");
+        console.log("🔍 Search interval reached");
         await runStage1to4();
         setLastSearchTime();
       } else {
@@ -142,13 +140,13 @@ function runCommenterDetached() {
         }
       }
 
-      /* ✍️ GENERATE */
+      /* ✍️ GENERATE COMMENTS */
       if (hasPending) {
-        console.log("✍️ Stage 5A: Generating comment");
-        await generateCommentsForQueue({ batchSize: 1 });
+        console.log("✍️ Generating comments");
+        await generateCommentsForQueue({ limit: 1 });
       }
 
-      /* 🚀 POST (NON-BLOCKING) */
+      /* 🚀 POST COMMENTS */
       if (hasReady) {
         runCommenterDetached(); // DO NOT await
       }
@@ -157,7 +155,7 @@ function runCommenterDetached() {
       console.error("❌ Loop error (recovered):", err);
     }
 
-    console.log("😴 Loop sleeping 1 min");
+    console.log("😴 Sleeping 1 min");
     await sleep(LOOP_SLEEP_MS);
   }
 })();

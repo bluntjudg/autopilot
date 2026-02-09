@@ -1,19 +1,70 @@
 import fs from "fs";
 import fetch from "node-fetch";
-import path from "path";
 
 const SUBREDDITS_PATH = "config/subreddits.json";
 const QUERIES_PATH = "config/queries.json";
 const OUTPUT_PATH = "data/fetched_posts.json";
 
-function readJSON(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+/**
+ * Safe JSON reader
+ */
+function readJSON(filePath, fallback = {}) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    const raw = fs.readFileSync(filePath, "utf-8");
+    if (!raw.trim()) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
 }
 
-function saveFetchedPosts(posts) {
-  fs.writeFileSync(OUTPUT_PATH, JSON.stringify(posts, null, 2));
+/**
+ * Load existing fetched posts into a Set (disk memory)
+ */
+function loadExistingPostKeys() {
+  const existing = readJSON(OUTPUT_PATH, []);
+  const keys = new Set();
+
+  for (const post of existing) {
+    if (post.post_id) keys.add(post.post_id);
+    else if (post.url) keys.add(post.url);
+  }
+
+  return { existing, keys };
 }
 
+/**
+ * Append ONLY new, unique posts to fetched_posts.json
+ */
+function appendFreshPostsOnly(newPosts) {
+  const { existing, keys } = loadExistingPostKeys();
+  const fresh = [];
+
+  for (const post of newPosts) {
+    const key = post.post_id || post.url;
+    if (keys.has(key)) {
+      console.log(`⛔ Duplicate skipped (disk): ${key}`);
+      continue;
+    }
+    keys.add(key);
+    fresh.push(post);
+  }
+
+  if (fresh.length === 0) {
+    console.log("⛔ No new unique posts found");
+    return 0;
+  }
+
+  const updated = [...existing, ...fresh];
+  fs.writeFileSync(OUTPUT_PATH, JSON.stringify(updated, null, 2));
+
+  return fresh.length;
+}
+
+/**
+ * Build Reddit search URL
+ */
 function buildSearchUrl({ subreddit, query, after }) {
   const base = `https://www.reddit.com/r/${subreddit}/search.json`;
   const params = new URLSearchParams({
@@ -25,25 +76,26 @@ function buildSearchUrl({ subreddit, query, after }) {
   });
 
   if (after) params.set("after", after);
-
   return `${base}?${params.toString()}`;
 }
 
+/**
+ * Fetch posts from a subreddit + query
+ */
 async function fetchSubredditPosts(subreddit, query) {
   let after = null;
   let allPosts = [];
 
-  for (let page = 0; page < 2; page++) { // limit pages for safety
-    const url = buildSearchUrl({ subreddit, query, after });
+  for (let page = 0; page < 2; page++) {
+    console.log(`🔍 Fetching: ${subreddit} | "${query}"`);
 
-    console.log(`🔍 Fetching: ${url}`);
-
-    const res = await fetch(url, {
-      headers: { "User-Agent": "reddit-automation-bot/1.0" }
-    });
+    const res = await fetch(
+      buildSearchUrl({ subreddit, query, after }),
+      { headers: { "User-Agent": "reddit-automation-bot/1.0" } }
+    );
 
     if (!res.ok) {
-      console.error(`❌ Failed ${res.status} for ${subreddit}`);
+      console.error(`❌ ${res.status} for r/${subreddit}`);
       break;
     }
 
@@ -64,7 +116,6 @@ async function fetchSubredditPosts(subreddit, query) {
     }));
 
     allPosts.push(...normalized);
-
     after = json?.data?.after;
     if (!after) break;
   }
@@ -72,24 +123,36 @@ async function fetchSubredditPosts(subreddit, query) {
   return allPosts;
 }
 
+/**
+ * PURE SEARCH WORKER
+ * No sleep. No rate logic. No orchestration.
+ */
 export async function runSearchEngine() {
-  const { subreddits } = readJSON(SUBREDDITS_PATH);
-  const { templates } = readJSON(QUERIES_PATH);
+  const { subreddits } = readJSON(SUBREDDITS_PATH, { subreddits: "" });
+  const { templates } = readJSON(QUERIES_PATH, { templates: [] });
 
-  const subredditList = subreddits.split(",").map(s => s.trim());
-  let collectedPosts = [];
+  const subredditList = subreddits
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  let collected = [];
 
   for (const subreddit of subredditList) {
     for (const query of templates) {
       const posts = await fetchSubredditPosts(subreddit, query);
-      collectedPosts.push(...posts);
+      collected.push(...posts);
     }
   }
 
-  if (collectedPosts.length > 0) {
-    saveFetchedPosts(collectedPosts);
-    console.log(`✅ Saved ${collectedPosts.length} raw posts`);
-  } else {
-    console.log("⚠️ No posts fetched");
+  if (collected.length === 0) {
+    console.log("⚠️ Search completed — no posts fetched");
+    return;
   }
+
+  const added = appendFreshPostsOnly(collected);
+
+  console.log(
+    `✅ Search completed — ${added} new posts added (out of ${collected.length})`
+  );
 }

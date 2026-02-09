@@ -1,96 +1,60 @@
 import fs from "fs";
-import path from "path";
 import { callOpenAI } from "./aiClient.js";
 
-const INTENT_PATH = "intent/personalization.md";
+const FETCHED_PATH = "data/fetched_posts.json";
 const DECISIONS_PATH = "data/ai_decisions.json";
+const APPROVED_PATH = "data/approved_posts.json";
+const REJECTED_PATH = "data/rejected_posts.json";
+const INTENT_PATH = "intent/personalization.md";
 
-/**
- * Safely read JSON file
- */
-function safeReadJSON(filePath) {
-  try {
-    if (!fs.existsSync(filePath)) return [];
-    const raw = fs.readFileSync(filePath, "utf-8");
-    if (!raw.trim()) return [];
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error("⚠️ Corrupt JSON detected, resetting:", filePath);
-    return [];
-  }
+/* ---------- helpers ---------- */
+
+function readJSON(path) {
+  if (!fs.existsSync(path)) return [];
+  const raw = fs.readFileSync(path, "utf-8");
+  if (!raw.trim()) return [];
+  return JSON.parse(raw);
 }
 
-/**
- * Load AI decisions into a lookup map keyed by post_id
- */
-function loadDecisionMap() {
-  const list = safeReadJSON(DECISIONS_PATH);
-  const map = {};
-
-  for (const entry of list) {
-    if (entry.post_id) {
-      map[entry.post_id] = entry;
-    }
-  }
-
-  return map;
+function writeJSON(path, data) {
+  fs.writeFileSync(path, JSON.stringify(data, null, 2));
 }
 
-/**
- * Persist a new AI decision
- */
-function recordDecision(entry) {
-  const existing = safeReadJSON(DECISIONS_PATH);
-  existing.push(entry);
+/* ---------- CORE PIPELINE ---------- */
 
-  fs.writeFileSync(
-    DECISIONS_PATH,
-    JSON.stringify(existing, null, 2)
-  );
-}
+export async function runAIFilter() {
+  console.log("🧠 AI Filter running (batch)");
 
-/**
- * Decide whether a Reddit post is relevant
- */
-export async function isPostRelevant(post) {
-  // 🔐 Load existing decisions
-  const decisionMap = loadDecisionMap();
-
-  // 🛑 HARD BLOCK: already reviewed → no OpenAI call
-  if (decisionMap[post.post_id]) {
-    const previous = decisionMap[post.post_id];
-
-    console.log(
-      `⏭️ OpenAI skipped for ${post.post_id} (${previous.decision})`
-    );
-
-    return {
-      approved: previous.decision === "APPROVED",
-      usage: {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0
-      }
-    };
+  const fetched = readJSON(FETCHED_PATH);
+  if (fetched.length === 0) {
+    console.log("📭 No fetched posts");
+    return;
   }
 
-  // 📄 Load intent rules
+  const decisions = readJSON(DECISIONS_PATH);
+  const approved = readJSON(APPROVED_PATH);
+  const rejected = readJSON(REJECTED_PATH);
+
+  const decidedIds = new Set(decisions.map(d => d.post_id));
   const intentRules = fs.readFileSync(INTENT_PATH, "utf-8");
 
-  const systemPrompt = `
+  let approvedCount = 0;
+  let rejectedCount = 0;
+
+  for (const post of fetched) {
+    if (!post.post_id || decidedIds.has(post.post_id)) continue;
+
+    const systemPrompt = `
 You are a strict Reddit post classifier.
 
 Approve ONLY posts that explicitly ask people to share
 what they are building or working on.
 
-If the post is not a direct invitation to share work,
-you MUST reject it.
-
-Respond with ONLY:
+Respond ONLY with:
 APPROVE or REJECT
 `;
 
-  const userPrompt = `
+    const userPrompt = `
 INTENT RULES:
 ${intentRules}
 
@@ -102,26 +66,41 @@ Subreddit: ${post.subreddit}
 Decision:
 `;
 
-  // 🤖 OpenAI call (ONLY ONCE PER POST)
-  const { content, usage } = await callOpenAI({
-    system: systemPrompt,
-    user: userPrompt
-  });
+    try {
+      const { content } = await callOpenAI({
+        system: systemPrompt,
+        user: userPrompt
+      });
 
-  const decisionText = content.trim().toUpperCase();
-  const approved = decisionText === "APPROVE";
+      const decision = content.trim().toUpperCase();
+      const approvedFlag = decision === "APPROVE";
 
-  // 💾 Save decision immediately
-  recordDecision({
-    timestamp: new Date().toISOString(),
-    post_id: post.post_id,
-    subreddit: post.subreddit,
-    title: post.title,
-    decision: approved ? "APPROVED" : "REJECTED"
-  });
+      const entry = {
+        ...post,
+        decided_at: new Date().toISOString(),
+        decision: approvedFlag ? "APPROVED" : "REJECTED"
+      };
 
-  return {
-    approved,
-    usage
-  };
+      decisions.push(entry);
+
+      if (approvedFlag) {
+        approved.push(entry);
+        approvedCount++;
+      } else {
+        rejected.push(entry);
+        rejectedCount++;
+      }
+
+    } catch (err) {
+      console.warn(`⚠️ AI failed for ${post.post_id}`);
+    }
+  }
+
+  writeJSON(DECISIONS_PATH, decisions);
+  writeJSON(APPROVED_PATH, approved);
+  writeJSON(REJECTED_PATH, rejected);
+
+  console.log(
+    `✅ AI Filter done → Approved: ${approvedCount}, Rejected: ${rejectedCount}`
+  );
 }

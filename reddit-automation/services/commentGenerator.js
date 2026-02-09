@@ -1,25 +1,17 @@
 import fs from "fs";
 import OpenAI from "openai";
+import { readJSON, writeJSON } from "./postStore.js";
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
+const APPROVED_PATH = "data/approved_posts.json";
 const QUEUE_PATH = "data/to_comment.json";
+const COMMENTED_PATH = "data/commented_posts.json";
 const PROMPT_PATH = "intent/comment_prompt.md";
 
 /* ---------- helpers ---------- */
-
-function readJSON(path) {
-  if (!fs.existsSync(path)) return [];
-  const raw = fs.readFileSync(path, "utf-8");
-  if (!raw.trim()) return [];
-  return JSON.parse(raw);
-}
-
-function writeJSON(path, data) {
-  fs.writeFileSync(path, JSON.stringify(data, null, 2));
-}
 
 function buildPrompt(template, post) {
   const body =
@@ -33,20 +25,37 @@ function buildPrompt(template, post) {
     .replace("{{body}}", body);
 }
 
+function buildIdSet(items) {
+  return new Set(items.map(p => p.post_id));
+}
+
 /* ---------- core ---------- */
 
 export async function generateCommentsOnly({ limit = 10 } = {}) {
+  const approved = readJSON(APPROVED_PATH);
   const queue = readJSON(QUEUE_PATH);
+  const commented = readJSON(COMMENTED_PATH);
+
+  const queuedIds = buildIdSet(queue);
+  const commentedIds = buildIdSet(commented);
+
   const template = fs.readFileSync(PROMPT_PATH, "utf-8");
 
-  const targets = queue.filter(p => p.status === "PENDING");
+  // 🔐 Only approved + not already queued + not commented
+  const targets = approved.filter(
+    p =>
+      !queuedIds.has(p.post_id) &&
+      !commentedIds.has(p.post_id)
+  );
 
   if (targets.length === 0) {
-    console.log("📭 No posts pending comment generation");
+    console.log("📭 No approved posts eligible for comment generation");
     return;
   }
 
-  console.log(`✍️ Generating comments for ${Math.min(limit, targets.length)} posts`);
+  console.log(
+    `✍️ Generating comments for ${Math.min(limit, targets.length)} approved posts`
+  );
 
   let generated = 0;
 
@@ -75,15 +84,18 @@ export async function generateCommentsOnly({ limit = 10 } = {}) {
 
     const comment = res.choices[0].message.content.trim();
 
-    // HARD GUARD
+    // HARD GUARD (unchanged)
     if (!comment.includes("https://asimpletool.com")) {
       console.warn(`⚠️ Skipping ${post.post_id} (website missing)`);
       continue;
     }
 
-    post.generated_comment = comment;
-    post.status = "COMMENT_READY";
-    post.generated_at = new Date().toISOString();
+    queue.push({
+      ...post,
+      generated_comment: comment,
+      status: "COMMENT_READY",
+      generated_at: new Date().toISOString()
+    });
 
     generated++;
     await new Promise(r => setTimeout(r, 1200));
