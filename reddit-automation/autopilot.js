@@ -1,16 +1,20 @@
 import fs from "fs";
-import { spawn } from "child_process";
+import { exec } from "child_process";
+import { promisify } from "util";
 
 import { runSearchEngine } from "./services/searchEngine.js";
 import { runAIFilter } from "./services/aiFilter.js";
 import { buildCommentQueue } from "./services/queueManager.js";
 import { generateCommentsForQueue } from "./services/commentGenerator.js";
 
+const execPromise = promisify(exec);
+
 /* ================= CONFIG ================= */
 
 const LAST_SEARCH_PATH = "data/last_search.json";
-const SEARCH_INTERVAL_MIN = 10;     // search rate limit (ONLY here)
-const LOOP_SLEEP_MS = 60 * 1000;    // heartbeat (1 min)
+const SEARCH_INTERVAL_MIN = 60;      // ✅ Less aggressive (was 10)
+const LOOP_SLEEP_MS = 120 * 1000;    // ✅ 2 minutes (was 1 minute)
+const COMMENT_BATCH_SIZE = 5;        // ✅ Generate 5 comments per cycle
 
 /* ================= UTILS ================= */
 
@@ -24,8 +28,8 @@ function safeReadJSON(path, fallback = []) {
     const raw = fs.readFileSync(path, "utf-8");
     if (!raw.trim()) return fallback;
     return JSON.parse(raw);
-  } catch {
-    console.warn(`⚠️ Failed reading ${path}, using fallback`);
+  } catch (err) {
+    console.warn(`⚠️ Failed reading ${path}: ${err.message}`);
     return fallback;
   }
 }
@@ -56,106 +60,214 @@ function shouldRunSearch() {
   return diffMin >= SEARCH_INTERVAL_MIN;
 }
 
+function getMinutesUntilNextSearch() {
+  const last = getLastSearchTime();
+  if (!last) return 0;
+  const diffMin = (Date.now() - last.getTime()) / 60000;
+  return Math.max(0, Math.ceil(SEARCH_INTERVAL_MIN - diffMin));
+}
+
+/* ================= CHROME CHECK ================= */
+
+async function isChromeRunning() {
+  try {
+    const response = await fetch("http://localhost:9222/json/version", {
+      signal: AbortSignal.timeout(2000)
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 /* ================= PIPELINE ================= */
 
 /**
- * Stage 1–4
- * Search → AI Filter → Queue
- *
- * NOTE:
- * - No per-post loops here
- * - No OpenAI calls here
- * - Everything is batch + disk-based
+ * ✅ Stage 1–4: Search → Filter → Queue → Generate
  */
 async function runStage1to4() {
-  console.log("\n🔄 Stage 1–4: Search → AI Filter → Queue");
+  console.log("\n" + "=".repeat(60));
+  console.log("🔄 PIPELINE STARTED: Search → Filter → Queue → Generate");
+  console.log("=".repeat(60));
 
-  // 1️⃣ Fetch & store (deduped internally)
-  await runSearchEngine();
+  try {
+    // ✅ 1. Fetch posts
+    console.log("\n📡 Stage 1: Search Engine");
+    await runSearchEngine();
 
-  // 2️⃣ Approve / reject new posts (deduped internally)
-  await runAIFilter();
+    // ✅ 2. AI approval/rejection
+    console.log("\n🧠 Stage 2: AI Filter");
+    await runAIFilter();
 
-  // 3️⃣ Build comment queue from approved posts
-  buildCommentQueue();
+    // ✅ 3. Build queue from approved posts
+    console.log("\n📥 Stage 3: Queue Manager");
+    buildCommentQueue();
+
+    // ✅ 4. Generate comments for pending posts
+    console.log("\n✍️  Stage 4: Comment Generator");
+    await generateCommentsForQueue({ limit: COMMENT_BATCH_SIZE });
+
+    console.log("\n" + "=".repeat(60));
+    console.log("✅ PIPELINE COMPLETED");
+    console.log("=".repeat(60));
+
+  } catch (err) {
+    console.error("\n❌ PIPELINE ERROR:", err.message);
+    console.error(err.stack);
+    throw err; // Re-throw to handle in main loop
+  }
 }
 
-/* ================= COMMENTER ================= */
+/* ================= COMMENTER (FIXED) ================= */
 
 /**
- * Fire-and-forget commenter
- * MUST NOT block autopilot loop
+ * ✅ FIXED: Run commenter synchronously with proper error handling
  */
-function runCommenterDetached() {
-  console.log("🚀 Spawning commenter (non-blocking)");
+async function runCommenterSync() {
+  console.log("\n🚀 Starting commenter...");
 
-  const child = spawn("node", ["playwright/commenter.js"], {
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: true
-  });
+  try {
+    // ✅ Use spawn that waits for completion
+    const { stdout, stderr } = await execPromise("node playwright/commenter.js");
+    
+    console.log(stdout);
+    if (stderr) console.error(stderr);
 
-  child.stdout.on("data", d => process.stdout.write(d.toString()));
-  child.stderr.on("data", d => process.stderr.write(d.toString()));
+    console.log("✅ Commenter finished");
+    return true;
 
-  child.unref(); // allow parent loop to continue
+  } catch (err) {
+    console.error("❌ Commenter error:", err.message);
+    return false;
+  }
+}
+
+/* ================= QUEUE STATUS ================= */
+
+function getQueueStatus() {
+  const queue = safeReadJSON("data/to_comment.json", []);
+  
+  const pending = queue.filter(p => p.status === "PENDING").length;
+  const ready = queue.filter(p => p.status === "COMMENT_READY").length;
+  const total = queue.length;
+
+  return { pending, ready, total };
 }
 
 /* ================= AUTOPILOT ================= */
 
 (async function autopilot() {
+  console.log("\n" + "=".repeat(60));
   console.log("🤖 AUTOPILOT STARTED (24×7 MODE)");
+  console.log("=".repeat(60));
+  console.log(`⏱️  Search interval: ${SEARCH_INTERVAL_MIN} minutes`);
+  console.log(`⏱️  Loop cycle: ${LOOP_SLEEP_MS / 1000} seconds`);
+  console.log(`📝 Comment batch size: ${COMMENT_BATCH_SIZE}`);
+  console.log("=".repeat(60));
 
   /* ---------- INITIAL BOOT ---------- */
 
+  // ✅ Check Chrome availability
+  const chromeRunning = await isChromeRunning();
+  if (!chromeRunning) {
+    console.warn("\n⚠️  WARNING: Chrome CDP not detected at localhost:9222");
+    console.warn("   Commenting will fail until Chrome is started with:");
+    console.warn("   google-chrome --remote-debugging-port=9222 --user-data-dir=$HOME/chrome-cdp\n");
+  } else {
+    console.log("✅ Chrome CDP detected and running\n");
+  }
+
+  // ✅ Initial search if needed
   if (shouldRunSearch()) {
-    console.log("🔍 Initial startup search");
-    await runStage1to4();
-    setLastSearchTime();
+    console.log("🔍 Running initial startup search");
+    try {
+      await runStage1to4();
+      setLastSearchTime();
+    } catch (err) {
+      console.error("❌ Initial search failed:", err.message);
+    }
   }
 
   /* ---------- MAIN LOOP ---------- */
 
+  let cycleCount = 0;
+
   while (true) {
-    console.log("\n🌀 Loop tick");
+    cycleCount++;
+    
+    console.log("\n" + "━".repeat(60));
+    console.log(`🌀 CYCLE #${cycleCount} | ${new Date().toLocaleTimeString()}`);
+    console.log("━".repeat(60));
 
     try {
-      const queue = safeReadJSON("data/to_comment.json", []);
+      const queueStatus = getQueueStatus();
+      
+      console.log(`📊 Queue Status: ${queueStatus.total} total | ${queueStatus.pending} pending | ${queueStatus.ready} ready`);
 
-      const hasPending = queue.some(p => p.status === "PENDING");
-      const hasReady = queue.some(p => p.status === "COMMENT_READY");
-
-      /* 🔍 SEARCH */
+      /* ========== ACTION 1: SEARCH ========== */
+      
       if (shouldRunSearch()) {
-        console.log("🔍 Search interval reached");
-        await runStage1to4();
-        setLastSearchTime();
+        console.log("\n🔍 Search interval reached - running full pipeline");
+        
+        try {
+          await runStage1to4();
+          setLastSearchTime();
+        } catch (err) {
+          console.error("❌ Pipeline failed (will retry next cycle):", err.message);
+        }
+        
       } else {
-        const last = getLastSearchTime();
-        if (last) {
-          const minsLeft = Math.ceil(
-            SEARCH_INTERVAL_MIN -
-            (Date.now() - last.getTime()) / 60000
-          );
-          console.log(`⏳ Next search in ~${minsLeft} min`);
+        const minsLeft = getMinutesUntilNextSearch();
+        console.log(`⏳ Next search in ${minsLeft} minutes`);
+        
+        /* ========== ACTION 2: GENERATE COMMENTS ========== */
+        
+        if (queueStatus.pending > 0) {
+          console.log(`\n✍️  Generating comments for ${Math.min(COMMENT_BATCH_SIZE, queueStatus.pending)} pending posts`);
+          
+          try {
+            await generateCommentsForQueue({ limit: COMMENT_BATCH_SIZE });
+          } catch (err) {
+            console.error("❌ Comment generation failed:", err.message);
+          }
         }
       }
 
-      /* ✍️ GENERATE COMMENTS */
-      if (hasPending) {
-        console.log("✍️ Generating comments");
-        await generateCommentsForQueue({ limit: 1 });
-      }
-
-      /* 🚀 POST COMMENTS */
-      if (hasReady) {
-        runCommenterDetached(); // DO NOT await
+      /* ========== ACTION 3: POST COMMENTS ========== */
+      
+      // ✅ Refresh queue status after potential generation
+      const updatedStatus = getQueueStatus();
+      
+      if (updatedStatus.ready > 0) {
+        console.log(`\n🚀 ${updatedStatus.ready} comments ready to post`);
+        
+        // ✅ Check Chrome before attempting
+        const chromeOk = await isChromeRunning();
+        if (!chromeOk) {
+          console.error("❌ Chrome CDP not available - skipping commenting");
+        } else {
+          const success = await runCommenterSync();
+          
+          if (success) {
+            console.log("✅ Comment posted successfully");
+          } else {
+            console.log("⚠️  Commenting failed - will retry next cycle");
+          }
+        }
+      } else {
+        console.log("📭 No comments ready to post");
       }
 
     } catch (err) {
-      console.error("❌ Loop error (recovered):", err);
+      console.error("\n❌ CYCLE ERROR (recovered):", err.message);
+      console.error(err.stack);
     }
 
-    console.log("😴 Sleeping 1 min");
+    /* ---------- SLEEP ---------- */
+
+    console.log(`\n😴 Sleeping for ${LOOP_SLEEP_MS / 1000} seconds...`);
+    console.log("━".repeat(60));
+    
     await sleep(LOOP_SLEEP_MS);
   }
 })();

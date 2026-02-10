@@ -1,17 +1,29 @@
 import fs from "fs";
 import OpenAI from "openai";
-import { readJSON, writeJSON } from "./postStore.js";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-const APPROVED_PATH = "data/approved_posts.json";
 const QUEUE_PATH = "data/to_comment.json";
 const COMMENTED_PATH = "data/commented_posts.json";
 const PROMPT_PATH = "intent/comment_prompt.md";
 
 /* ---------- helpers ---------- */
+
+function readJSON(path) {
+  if (!fs.existsSync(path)) return [];
+  const raw = fs.readFileSync(path, "utf-8");
+  if (!raw.trim()) return [];
+  return JSON.parse(raw);
+}
+
+function writeJSON(path, data) {
+  fs.writeFileSync(path, JSON.stringify(data, null, 2));
+}
 
 function buildPrompt(template, post) {
   const body =
@@ -25,85 +37,122 @@ function buildPrompt(template, post) {
     .replace("{{body}}", body);
 }
 
-function buildIdSet(items) {
-  return new Set(items.map(p => p.post_id));
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
-/* ---------- core ---------- */
+/* ---------- CORE (FIXED) ---------- */
 
-export async function generateCommentsOnly({ limit = 10 } = {}) {
-  const approved = readJSON(APPROVED_PATH);
+export async function generateCommentsForQueue({ limit = 10 } = {}) {
+  console.log("\n✍️  COMMENT GENERATOR STARTED");
+  console.log("=".repeat(50));
+
+  // ✅ Read from QUEUE (not approved_posts.json)
   const queue = readJSON(QUEUE_PATH);
   const commented = readJSON(COMMENTED_PATH);
 
-  const queuedIds = buildIdSet(queue);
-  const commentedIds = buildIdSet(commented);
+  // ✅ Build set of already commented post IDs
+  const commentedIds = new Set(commented.map(c => c.post_id));
 
-  const template = fs.readFileSync(PROMPT_PATH, "utf-8");
-
-  // 🔐 Only approved + not already queued + not commented
-  const targets = approved.filter(
-    p =>
-      !queuedIds.has(p.post_id) &&
-      !commentedIds.has(p.post_id)
+  // ✅ Find PENDING posts in the queue that haven't been commented yet
+  const targets = queue.filter(
+    p => p.status === "PENDING" && !commentedIds.has(p.post_id)
   );
 
   if (targets.length === 0) {
-    console.log("📭 No approved posts eligible for comment generation");
+    console.log("📭 No PENDING posts in queue");
     return;
   }
 
-  console.log(
-    `✍️ Generating comments for ${Math.min(limit, targets.length)} approved posts`
-  );
+  console.log(`📝 Found ${targets.length} PENDING posts`);
+  console.log(`🎯 Generating comments for ${Math.min(limit, targets.length)} posts`);
 
+  const template = fs.readFileSync(PROMPT_PATH, "utf-8");
   let generated = 0;
 
   for (const post of targets) {
     if (generated >= limit) break;
 
-    console.log(`🧠 Generating comment for: ${post.title}`);
+    console.log(`\n[${generated + 1}/${Math.min(limit, targets.length)}] ${post.title.substring(0, 60)}...`);
 
     const prompt = buildPrompt(template, post);
 
-    const res = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.6,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You personalize Reddit comments. You must ground the reply in the post body."
-        },
-        {
-          role: "user",
-          content: prompt
+    // ✅ Try up to 2 times to get a comment with the website link
+    let comment = null;
+    let attempts = 0;
+    const maxAttempts = 2;
+
+    while (attempts < maxAttempts) {
+      try {
+        const res = await client.chat.completions.create({
+          model: "gpt-4o-mini",
+          temperature: 0.6 + (attempts * 0.2), // Increase temperature on retry
+          messages: [
+            {
+              role: "system",
+              content: "You personalize Reddit comments. You MUST include https://asimpletool.com in your reply."
+            },
+            {
+              role: "user",
+              content: prompt
+            }
+          ]
+        });
+
+        comment = res.choices[0].message.content.trim();
+
+        // ✅ Check if link is included
+        if (comment.includes("https://asimpletool.com")) {
+          console.log(`   ✅ Comment generated (attempt ${attempts + 1})`);
+          break;
         }
-      ]
-    });
 
-    const comment = res.choices[0].message.content.trim();
+        console.warn(`   ⚠️  Attempt ${attempts + 1}: Link missing, retrying...`);
+        attempts++;
+        await sleep(1000);
 
-    // HARD GUARD (unchanged)
-    if (!comment.includes("https://asimpletool.com")) {
-      console.warn(`⚠️ Skipping ${post.post_id} (website missing)`);
-      continue;
+      } catch (err) {
+        console.error(`   ❌ API error: ${err.message}`);
+        attempts++;
+        if (attempts < maxAttempts) {
+          await sleep(2000);
+        }
+      }
     }
 
-    queue.push({
-      ...post,
-      generated_comment: comment,
-      status: "COMMENT_READY",
-      generated_at: new Date().toISOString()
-    });
+    // ✅ If we got a valid comment, update the post in the queue
+    if (comment && comment.includes("https://asimpletool.com")) {
+      // Find the post in the queue and update it
+      const queueIndex = queue.findIndex(p => p.post_id === post.post_id);
+      
+      if (queueIndex !== -1) {
+        queue[queueIndex].generated_comment = comment;
+        queue[queueIndex].status = "COMMENT_READY";
+        queue[queueIndex].generated_at = new Date().toISOString();
+        
+        generated++;
+        console.log(`   ✅ Status updated to COMMENT_READY`);
+      }
+    } else {
+      console.error(`   ❌ Skipping (link missing after ${maxAttempts} attempts)`);
+    }
 
-    generated++;
-    await new Promise(r => setTimeout(r, 1200));
+    // ✅ Small delay between generations
+    if (generated < Math.min(limit, targets.length)) {
+      await sleep(1200);
+    }
   }
 
+  // ✅ Save updated queue
   writeJSON(QUEUE_PATH, queue);
+
+  console.log("\n" + "=".repeat(50));
   console.log(`✅ Generated ${generated} comments`);
+  console.log(`📊 Queue updated with COMMENT_READY status`);
+  console.log("=".repeat(50));
+
+  return generated;
 }
 
 /* ---------- COMPATIBILITY EXPORT ---------- */
-export const generateCommentsForQueue = generateCommentsOnly;
+export const generateCommentsOnly = generateCommentsForQueue;
