@@ -47,6 +47,30 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/* ---------------- NEW HUMAN-LIKE DELAY ---------------- */
+
+function getHumanSubredditDelay() {
+  const r = Math.random();
+
+  if (r < 0.55) {
+    // Most common: 40–85 sec
+    return (40 + Math.random() * 45) * 1000;
+  }
+
+  if (r < 0.80) {
+    // Slower reading: 85–150 sec
+    return (85 + Math.random() * 65) * 1000;
+  }
+
+  if (r < 0.95) {
+    // Quick hop: 17–40 sec
+    return (17 + Math.random() * 23) * 1000;
+  }
+
+  // Rare long idle: 150–300 sec
+  return (150 + Math.random() * 150) * 1000;
+}
+
 /* ---------------- failure memory (FIXED) ---------------- */
 
 function getFailureState() {
@@ -58,7 +82,7 @@ function recordFailure(subreddit, status, consecutiveFailures = 1) {
   const prev = failures[subreddit] || { fail_count: 0, consecutive: 0 };
 
   const newConsecutive = consecutiveFailures;
-  const cooldownMinutes = Math.min(120, Math.pow(2, newConsecutive) * 5); // Exponential: 5, 10, 20, 40, 80, 120
+  const cooldownMinutes = Math.min(120, Math.pow(2, newConsecutive) * 5);
 
   const cooldownUntil = new Date(
     Date.now() + cooldownMinutes * 60 * 1000
@@ -159,56 +183,44 @@ function buildSearchUrl({ subreddit, query, after }) {
   return `${base}?${params.toString()}`;
 }
 
-/**
- * ✅ FIXED: Fetch with retries, delays, and proper error handling
- */
 async function fetchWithRetry(url, options, maxRetries = 3) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       const response = await fetch(url, {
         ...options,
-        signal: AbortSignal.timeout(30000) // 30 second timeout
+        signal: AbortSignal.timeout(30000)
       });
 
-      // ✅ Handle 429 specifically
       if (response.status === 429) {
         const retryAfter = response.headers.get('retry-after');
         const waitSeconds = retryAfter ? parseInt(retryAfter) : Math.pow(2, attempt) * 10;
-        
-        console.warn(`⚠️ 429 Rate limit - waiting ${waitSeconds}s (attempt ${attempt}/${maxRetries})`);
-        
+
         if (attempt < maxRetries) {
           await sleep(waitSeconds * 1000);
           continue;
         }
-        
+
         return { ok: false, status: 429, error: "Rate limited" };
       }
 
-      // ✅ Handle other errors
       if (!response.ok) {
-        console.warn(`⚠️ HTTP ${response.status} (attempt ${attempt}/${maxRetries})`);
-        
         if (attempt < maxRetries && response.status >= 500) {
-          await sleep(Math.pow(2, attempt) * 2000); // Exponential backoff
+          await sleep(Math.pow(2, attempt) * 2000);
           continue;
         }
-        
+
         return { ok: false, status: response.status, error: `HTTP ${response.status}` };
       }
 
-      // ✅ Success
       const json = await response.json();
       return { ok: true, data: json };
 
     } catch (err) {
-      console.warn(`⚠️ Request error: ${err.message} (attempt ${attempt}/${maxRetries})`);
-      
       if (attempt < maxRetries) {
         await sleep(Math.pow(2, attempt) * 2000);
         continue;
       }
-      
+
       return { ok: false, status: 0, error: err.message };
     }
   }
@@ -216,16 +228,12 @@ async function fetchWithRetry(url, options, maxRetries = 3) {
   return { ok: false, status: 0, error: "Max retries exceeded" };
 }
 
-/**
- * ✅ FIXED: Fetch subreddit posts with proper pacing and error handling
- */
 async function fetchSubredditPosts(subreddit, query) {
   let after = null;
   let allPosts = [];
   let consecutiveFailures = getConsecutiveFailures(subreddit);
 
   for (let page = 0; page < 2; page++) {
-    // ✅ Add delay between requests (3-5 seconds)
     if (page > 0) {
       const delayMs = 3000 + Math.random() * 2000;
       console.log(`⏱️  Waiting ${Math.round(delayMs/1000)}s before next page...`);
@@ -233,7 +241,7 @@ async function fetchSubredditPosts(subreddit, query) {
     }
 
     const url = buildSearchUrl({ subreddit, query, after });
-    
+
     console.log(`🔍 Fetching r/${subreddit} "${query}" (page ${page + 1}/2)`);
 
     const result = await fetchWithRetry(url, {
@@ -243,17 +251,12 @@ async function fetchSubredditPosts(subreddit, query) {
       }
     });
 
-    // ✅ Handle failure without crashing
     if (!result.ok) {
       consecutiveFailures++;
       recordFailure(subreddit, result.error, consecutiveFailures);
-      
-      // Don't throw - just return what we have so far
-      console.warn(`⚠️ Stopped at page ${page + 1} due to: ${result.error}`);
       break;
     }
 
-    // ✅ Success - reset consecutive failures
     if (consecutiveFailures > 0) {
       clearFailure(subreddit);
       consecutiveFailures = 0;
@@ -276,11 +279,8 @@ async function fetchSubredditPosts(subreddit, query) {
 
     allPosts.push(...normalized);
     after = result.data?.data?.after;
-    
-    if (!after) {
-      console.log(`✅ No more pages for r/${subreddit}`);
-      break;
-    }
+
+    if (!after) break;
   }
 
   return allPosts;
@@ -290,7 +290,7 @@ async function fetchSubredditPosts(subreddit, query) {
 
 export async function runSearchEngine() {
   console.log("\n🔍 SEARCH ENGINE STARTED");
-  console.log("=" .repeat(50));
+  console.log("=".repeat(50));
 
   const { subreddits } = readJSON(SUBREDDITS_PATH, { subreddits: "" });
   const { templates } = readJSON(QUERIES_PATH, { templates: [] });
@@ -300,62 +300,42 @@ export async function runSearchEngine() {
     .map(s => s.trim())
     .filter(Boolean);
 
-  console.log(`📊 Subreddits: ${subredditList.length}`);
-  console.log(`📊 Queries: ${templates.length}`);
-
   let totalCollected = 0;
   let totalAdded = 0;
   let skippedCount = 0;
 
   for (let i = 0; i < subredditList.length; i++) {
     const subreddit = subredditList[i];
-    
-    console.log(`\n[${i + 1}/${subredditList.length}] r/${subreddit}`);
 
-    // ✅ Skip if cooling down
     if (isSubredditCoolingDown(subreddit)) {
       skippedCount++;
       continue;
     }
 
     for (const query of templates) {
-      try {
-        const posts = await fetchSubredditPosts(subreddit, query);
-        
-        if (posts.length > 0) {
-          totalCollected += posts.length;
-          const added = appendFreshPostsOnly(posts);
-          totalAdded += added;
-          
-          console.log(`📥 Collected ${posts.length}, Added ${added} new posts`);
-        } else {
-          console.log(`📭 No posts found`);
-        }
+      const posts = await fetchSubredditPosts(subreddit, query);
 
-        // ✅ Delay between queries (2-4 seconds)
-        if (templates.indexOf(query) < templates.length - 1) {
-          const delayMs = 2000 + Math.random() * 2000;
-          await sleep(delayMs);
-        }
+      if (posts.length > 0) {
+        totalCollected += posts.length;
+        const added = appendFreshPostsOnly(posts);
+        totalAdded += added;
+      }
 
-      } catch (err) {
-        console.error(`❌ Unexpected error for r/${subreddit}: ${err.message}`);
-        // Don't break - continue to next query
+      if (templates.indexOf(query) < templates.length - 1) {
+        const delayMs = 2000 + Math.random() * 2000;
+        await sleep(delayMs);
       }
     }
 
-    // ✅ Delay between subreddits (5-7 seconds)
     if (i < subredditList.length - 1) {
-      const delayMs = 5000 + Math.random() * 2000;
+      const delayMs = getHumanSubredditDelay();
       console.log(`⏱️  Waiting ${Math.round(delayMs/1000)}s before next subreddit...`);
       await sleep(delayMs);
     }
   }
 
-  console.log("\n" + "=".repeat(50));
-  console.log("✅ SEARCH ENGINE COMPLETED");
+  console.log("\n✅ SEARCH ENGINE COMPLETED");
   console.log(`📊 Total collected: ${totalCollected}`);
   console.log(`📊 New posts added: ${totalAdded}`);
-  console.log(`📊 Subreddits skipped (cooldown): ${skippedCount}`);
-  console.log("=".repeat(50) + "\n");
+  console.log(`📊 Subreddits skipped (cooldown): ${skippedCount}\n`);
 }
