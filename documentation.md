@@ -1,4 +1,5 @@
-Step 1 :- google-chrome   --remote-debugging-port=9222 --user-data-dir=$HOME/chrome-cdp
+Step 1 :- google-chrome   --remote-debugging-port=9222 --user-data-dir=$HOME/chrome-cdp for automation 1 reddit-automation
+          google-chrome   --remote-debugging-port=9224   --user-data-dir=$HOME/chrome-cdp-seo for automation 2 knowledge-automation
 Step 2 :-  cd reddit-automation/
  
 Step 3 :-  curl http://localhost:9222/json/version

@@ -1,0 +1,5 @@
+{
+  "fetch_to_comment_delay_seconds": [60, 120],
+  "between_comments_delay_seconds": [180, 300],
+  "cycle_break_minutes": 15
+}
