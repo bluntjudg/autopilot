@@ -10,8 +10,8 @@ import { generateCommentsForQueue } from "./services/commentGenerator.js";
 const execPromise = promisify(exec);
 
 const LAST_SEARCH_PATH = "data/last_search.json";
-const SEARCH_INTERVAL_MIN = 30; // 1 hours
-const COMMENT_BATCH_SIZE = 2; // safer for authority account
+const SEARCH_INTERVAL_MIN = 30; // 30 min search interval
+const COMMENT_BATCH_SIZE = 2; // safer for new / authority account
 
 /* ---------------- UTIL ---------------- */
 
@@ -52,11 +52,33 @@ function shouldRunSearch() {
   return diffMin >= SEARCH_INTERVAL_MIN;
 }
 
-/* -------- RANDOMIZED SLEEP (2.5–4 mins) -------- */
+/* -------- HUMAN-LIKE COMMENT DELAY (CRITICAL FIX) -------- */
+/*
+Distribution:
+70% → 20–50 min (normal human use)
+20% → 50–90 min (long breaks)
+10% → 10–20 min (rare short burst)
+*/
 
-function getRandomSleep() {
-  // 150 to 240 seconds
-  return (150 + Math.random() * 90) * 1000;
+function getHumanCommentDelay() {
+  const r = Math.random();
+
+  let min, max;
+
+  if (r < 0.7) {
+    min = 20 * 60;
+    max = 50 * 60;
+  } else if (r < 0.9) {
+    min = 50 * 60;
+    max = 90 * 60;
+  } else {
+    min = 10 * 60;
+    max = 20 * 60;
+  }
+
+  const delaySeconds = Math.floor(Math.random() * (max - min) + min);
+
+  return delaySeconds * 1000;
 }
 
 /* ---------------- COMMENTER ---------------- */
@@ -75,38 +97,74 @@ async function runCommenterSync() {
 /* ---------------- MAIN LOOP ---------------- */
 
 (async function autopilot() {
+
   console.log("🧠 SEO Knowledge Automation Started");
 
-  // Initial run
+  /* Initial pipeline run */
+
   if (shouldRunSearch()) {
+
+    console.log("🔍 Initial pipeline run");
+
     await runSearchEngine();
     await runAIFilter();
     buildCommentQueue();
-    await generateCommentsForQueue({ limit: COMMENT_BATCH_SIZE });
+
+    await generateCommentsForQueue({
+      limit: COMMENT_BATCH_SIZE
+    });
+
     setLastSearchTime();
   }
 
+  /* Infinite loop */
+
   while (true) {
+
     try {
+
       if (shouldRunSearch()) {
+
         console.log("🔍 Running full pipeline...");
+
         await runSearchEngine();
+
         await runAIFilter();
+
         buildCommentQueue();
-        await generateCommentsForQueue({ limit: COMMENT_BATCH_SIZE });
+
+        await generateCommentsForQueue({
+          limit: COMMENT_BATCH_SIZE
+        });
+
         setLastSearchTime();
+
       } else {
-        await generateCommentsForQueue({ limit: COMMENT_BATCH_SIZE });
+
+        await generateCommentsForQueue({
+          limit: COMMENT_BATCH_SIZE
+        });
+
       }
 
       await runCommenterSync();
 
     } catch (err) {
+
       console.error("❌ Loop error:", err.message);
+
     }
 
-    const delay = getRandomSleep();
-    console.log(`😴 Sleeping for ${Math.round(delay / 1000)} seconds`);
+    /* SAFE HUMAN-LIKE DELAY */
+
+    const delay = getHumanCommentDelay();
+
+    console.log(
+      `😴 Sleeping for ${Math.round(delay / 60000)} minutes`
+    );
+
     await sleep(delay);
+
   }
+
 })();
