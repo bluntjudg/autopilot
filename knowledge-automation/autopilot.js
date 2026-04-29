@@ -52,13 +52,7 @@ function shouldRunSearch() {
   return diffMin >= SEARCH_INTERVAL_MIN;
 }
 
-/* -------- HUMAN-LIKE COMMENT DELAY (CRITICAL FIX) -------- */
-/*
-Distribution:
-70% → 20–50 min (normal human use)
-20% → 50–90 min (long breaks)
-10% → 10–20 min (rare short burst)
-*/
+
 
 function getHumanCommentDelay() {
   const r = Math.random();
